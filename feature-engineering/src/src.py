@@ -109,28 +109,47 @@ def compare_entities(entity_1_row, entity_2_row, model):
     return features
 
 
-def merge_rows(row1, row2):
-    def safe_concat(val1, val2, separator):
-        val1 = str(val1) if pd.notna(val1) else ''
-        val2 = str(val2) if pd.notna(val2) else ''
-        return (val1 + separator + val2).strip(separator)
+def safe_get(row, key, default=''):
+    value = row.get(key)
+    if pd.isna(value):
+        return default
+    return str(value)
 
+def merge_rows(row1, row2):
     merged_row = row1.copy()
     
-    # Safely concatenate 'entity_1_role'
-    merged_row['entity_1_role'] = safe_concat(row1.get('entity_1_role', ''), 
-                                              row2.get('entity_1_role', ''), 
-                                              '; ')
+    # Create or update the merged_data dictionary
+    if 'merged_data' not in merged_row or pd.isna(merged_row['merged_data']):
+        merged_row['merged_data'] = {}
+    elif isinstance(merged_row['merged_data'], float):
+        merged_row['merged_data'] = {}
     
-    # Safely concatenate 'entity_1_context'
-    merged_row['entity_1_context'] = safe_concat(row1.get('entity_1_context', ''), 
-                                                 row2.get('entity_1_context', ''), 
-                                                 ' ')
+    # Add data from row1
+    fn1 = safe_get(row1, 'fn')
+    if fn1 and fn1 not in merged_row['merged_data']:
+        merged_row['merged_data'][fn1] = []
+    if fn1:
+        merged_row['merged_data'][fn1].append({
+            'person_uid': safe_get(row1, 'person_uid'),
+            'officer_context': safe_get(row1, 'officer_context'),
+            'officer_role': safe_get(row1, 'officer_role')
+        })
     
-    # Safely concatenate 'entity_1_page_number'
-    merged_row['entity_1_page_number'] = safe_concat(row1.get('entity_1_page_number', ''), 
-                                                     row2.get('entity_1_page_number', ''), 
-                                                     ', ')
+    # Add data from row2
+    fn2 = safe_get(row2, 'fn')
+    if fn2 and fn2 not in merged_row['merged_data']:
+        merged_row['merged_data'][fn2] = []
+    if fn2:
+        merged_row['merged_data'][fn2].append({
+            'person_uid': safe_get(row2, 'person_uid'),
+            'officer_context': safe_get(row2, 'officer_context'),
+            'officer_role': safe_get(row2, 'officer_role')
+        })
+    
+    # Update the main columns (for quick reference)
+    merged_row['officer_context'] = ' '.join(filter(None, [safe_get(row1, 'officer_context'), safe_get(row2, 'officer_context')]))
+    merged_row['officer_role'] = '; '.join(filter(None, [safe_get(row1, 'officer_role'), safe_get(row2, 'officer_role')]))
+    merged_row['fn'] = ', '.join(filter(None, [fn1, fn2]))
     
     return merged_row
 
@@ -249,15 +268,15 @@ def parallel_iterative_merge(df, model, num_processes=None):
     return df
 
 def main():
-    df = read_csv("../../blocking/data/output/clean-with-blocks.csv")
+    df = read_csv("../../blocking/data/output/clean-index-with-blocks.csv")
     df = df.drop_duplicates()
     df = df.sample(n=5000, random_state=1) 
     model = read_model('../../ts-train-model/data/output/trained_lr_model.pkl')
     
-    merged_df = parallel_iterative_merge(df, model, num_processes=20)
+    merged_df = parallel_iterative_merge(df, model, num_processes=25)
     
     print("Merged DataFrame shape:", merged_df.shape)
-    merged_df.to_csv("../data/output/merged_profiles.csv", index=False)
+    merged_df.to_csv("../data/output/merged_officer_profiles.csv", index=False)
 
 if __name__ == "__main__":
     main()
