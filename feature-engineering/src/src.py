@@ -11,8 +11,8 @@ import multiprocessing as mp
 from functools import partial
 import pickle
 import torch
-from itertools import combinations
-import multiprocessing as mp
+from itertools import combinations, chain
+import networkx as nx
 
 nltk.download('punkt', quiet=True)
 stemmer = PorterStemmer()
@@ -26,17 +26,8 @@ def read_model(file_path):
     with open(file_path, 'rb') as f:
         return pickle.load(f)
 
-def stem_tokens(tokens):
-    return [stemmer.stem(token) for token in tokens]
-
-def tokenize_and_stem(context):
-    tokens = word_tokenize(context)
-    return stem_tokens(tokens)
-
 def calculate_string_similarity(s1, s2):
-    # Ensure the inputs are strings
-    s1 = str(s1)
-    s2 = str(s2)
+    s1, s2 = str(s1), str(s2)
     return jellyfish.jaro_winkler_similarity(s1, s2)
 
 def calculate_context_similarity(contexts1, contexts2):
@@ -47,23 +38,22 @@ def calculate_context_similarity(contexts1, contexts2):
     embeddings1 = model.encode(contexts1, convert_to_tensor=True)
     embeddings2 = model.encode(contexts2, convert_to_tensor=True)
     
-    embeddings1_np = embeddings1.cpu().numpy()
-    embeddings2_np = embeddings2.cpu().numpy()
-    
-    cosine_similarities = np.diag(cosine_similarity(embeddings1_np, embeddings2_np)).tolist()
+    cosine_similarities = np.diag(cosine_similarity(embeddings1.cpu().numpy(), embeddings2.cpu().numpy())).tolist()
     
     return cosine_similarities
 
+def safe_str(value):
+    return str(value) if pd.notna(value) else ''
 
 def compare_entities(entity_1_row, entity_2_row, model):
-    def safe_str(value):
-        return str(value) if pd.notna(value) else ''
-
-    # Ensure the names are strings and handle NaN values
-    entity_1_first_name = safe_str(entity_1_row['first_name'])
-    entity_2_first_name = safe_str(entity_2_row['first_name'])
-    entity_1_last_name = safe_str(entity_1_row['last_name'])
-    entity_2_last_name = safe_str(entity_2_row['last_name'])
+    entity_1_first_name = safe_str(entity_1_row['first_name']).lower()
+    entity_2_first_name = safe_str(entity_2_row['first_name']).lower()
+    entity_1_last_name = safe_str(entity_1_row['last_name']).lower()
+    entity_2_last_name = safe_str(entity_2_row['last_name']).lower()
+    
+    # Check for perfect match first
+    if entity_1_first_name == entity_2_first_name and entity_1_last_name == entity_2_last_name:
+        return {'prediction': 1.0}
     
     first_name_similarity = calculate_string_similarity(entity_1_first_name, entity_2_first_name)
     last_name_similarity = calculate_string_similarity(entity_1_last_name, entity_2_last_name)
@@ -72,20 +62,6 @@ def compare_entities(entity_1_row, entity_2_row, model):
         return None
     
     features = {
-        'entity_1_uid': safe_str(entity_1_row['person_uid']),
-        'entity_1_first_name': entity_1_first_name,
-        'entity_1_last_name': entity_1_last_name,
-        'entity_1_role': safe_str(entity_1_row.get('officer_role', '')),
-        'entity_1_context': safe_str(entity_1_row.get('officer_context', '')),
-        'entity_1_fn': safe_str(entity_1_row['fn']),
-        'entity_1_page_number': safe_str(entity_1_row['page_number']),
-        'entity_2_uid': safe_str(entity_2_row['person_uid']),
-        'entity_2_first_name': entity_2_first_name,
-        'entity_2_last_name': entity_2_last_name,
-        'entity_2_role': safe_str(entity_2_row.get('officer_role', '')),
-        'entity_2_context': safe_str(entity_2_row.get('officer_context', '')),
-        'entity_2_fn': safe_str(entity_2_row['fn']),
-        'entity_2_page_number': safe_str(entity_2_row['page_number']),
         'first_name_similarity': first_name_similarity,
         'last_name_similarity': last_name_similarity,
         'role_similarity': calculate_string_similarity(
@@ -100,180 +76,134 @@ def compare_entities(entity_1_row, entity_2_row, model):
         )[0],
     }
     
-    # Apply the trained model to make predictions
     scaler = MinMaxScaler()
-    scaled_features = scaler.fit_transform([list(features.values())[-6:]])
-    prediction = model.predict_proba(scaled_features)[0][0]
-    features['prediction'] = prediction
+    scaled_features = scaler.fit_transform([list(features.values())])
+    prediction = model.predict_proba(scaled_features)[0][1]
+    return {'prediction': prediction}
+
+def process_within_doc_comparisons(df, model, num_processes):
+    grouped = df.groupby('fn')
+    all_matches = []
+    for _, group in grouped:
+        comparisons = list(combinations(group.index, 2))
+        chunk_size = max(1, len(comparisons) // num_processes)
+        chunks = [comparisons[i:i + chunk_size] for i in range(0, len(comparisons), chunk_size)]
+        
+        with mp.Pool(processes=num_processes) as pool:
+            results = pool.map(
+                partial(process_comparison_chunk, df=df, model=model, within_doc=True),
+                chunks
+            )
+        all_matches.extend(chain.from_iterable(results))
+    return all_matches
+
+def process_between_doc_comparisons(df, model, num_processes):
+    comparisons = list(combinations(df.index, 2))
+    comparisons = [pair for pair in comparisons if df.loc[pair[0], 'fn'] != df.loc[pair[1], 'fn']]
     
-    return features
+    chunk_size = max(1, len(comparisons) // num_processes)
+    chunks = [comparisons[i:i + chunk_size] for i in range(0, len(comparisons), chunk_size)]
+    
+    with mp.Pool(processes=num_processes) as pool:
+        results = pool.map(
+            partial(process_comparison_chunk, df=df, model=model, within_doc=False),
+            chunks
+        )
+    return list(chain.from_iterable(results))
 
+def batch_parallel_iterative_merge(df, model, batch_size=10, num_processes=20):
+    all_documents = df['fn'].unique()
+    final_merged_df = pd.DataFrame()
 
-def safe_get(row, key, default=''):
-    value = row.get(key)
-    if pd.isna(value):
-        return default
-    return str(value)
+    for i in range(0, len(all_documents), batch_size):
+        batch_docs = all_documents[i:i+batch_size]
+        batch_df = df[df['fn'].isin(batch_docs)]
 
+        # Within-document deduplication for this batch
+        within_doc_matches = process_within_doc_comparisons(batch_df, model, num_processes)
+        batch_merged_within = merge_matches(batch_df, within_doc_matches)
+
+        # Between-document comparisons for this batch
+        between_doc_matches = process_between_doc_comparisons(batch_merged_within, model, num_processes)
+        batch_final_merged = merge_matches(batch_merged_within, between_doc_matches)
+
+        # Append to final results
+        final_merged_df = pd.concat([final_merged_df, batch_final_merged])
+
+    # Final between-document comparisons across all batches
+    final_between_doc_matches = process_between_doc_comparisons(final_merged_df, model, num_processes)
+    final_merged_df = merge_matches(final_merged_df, final_between_doc_matches)
+
+    return final_merged_df
+
+def process_comparison_chunk(chunk, df, model, within_doc):
+    matches = []
+    for i, j in chunk:
+        if within_doc and are_perfect_match(df.loc[i], df.loc[j]):
+            matches.append((i, j, {'prediction': 1.0}))
+        else:
+            comparison = compare_entities(df.loc[i], df.loc[j], model)
+            if comparison and comparison['prediction'] > 0.5:
+                matches.append((i, j, comparison))
+    return matches
+
+def are_perfect_match(row1, row2):
+    return (safe_str(row1['first_name']).lower() == safe_str(row2['first_name']).lower() and
+            safe_str(row1['last_name']).lower() == safe_str(row2['last_name']).lower())
+
+def merge_matches(df, matches):
+    G = nx.Graph()
+    G.add_edges_from([(m[0], m[1]) for m in matches])
+    
+    merged_groups = list(nx.connected_components(G))
+    
+    merged_rows = []
+    for group in merged_groups:
+        merged_row = df.loc[list(group)[0]].copy()
+        for idx in list(group)[1:]:
+            merged_row = merge_rows(merged_row, df.loc[idx])
+        merged_rows.append(merged_row)
+    
+    # Add unmatched rows
+    unmatched = set(df.index) - set(chain.from_iterable(merged_groups))
+    for idx in unmatched:
+        merged_rows.append(df.loc[idx])
+    
+    return pd.DataFrame(merged_rows)
+    
 def merge_rows(row1, row2):
     merged_row = row1.copy()
     
-    # Create or update the merged_data dictionary
-    if 'merged_data' not in merged_row or pd.isna(merged_row['merged_data']):
-        merged_row['merged_data'] = {}
-    elif isinstance(merged_row['merged_data'], float):
+    # Ensure merged_data is a dictionary
+    if not isinstance(merged_row.get('merged_data'), dict):
         merged_row['merged_data'] = {}
     
-    # Add data from row1
-    fn1 = safe_get(row1, 'fn')
-    if fn1 and fn1 not in merged_row['merged_data']:
-        merged_row['merged_data'][fn1] = []
-    if fn1:
-        merged_row['merged_data'][fn1].append({
-            'person_uid': safe_get(row1, 'person_uid'),
-            'officer_context': safe_get(row1, 'officer_context'),
-            'officer_role': safe_get(row1, 'officer_role')
-        })
+    for row in [row1, row2]:
+        fn = safe_str(row['fn'])
+        if fn:
+            if fn not in merged_row['merged_data']:
+                merged_row['merged_data'][fn] = []
+            merged_row['merged_data'][fn].append({
+                'person_uid': safe_str(row['person_uid']),
+                'officer_context': safe_str(row.get('officer_context', '')),
+                'officer_role': safe_str(row.get('officer_role', ''))
+            })
     
-    # Add data from row2
-    fn2 = safe_get(row2, 'fn')
-    if fn2 and fn2 not in merged_row['merged_data']:
-        merged_row['merged_data'][fn2] = []
-    if fn2:
-        merged_row['merged_data'][fn2].append({
-            'person_uid': safe_get(row2, 'person_uid'),
-            'officer_context': safe_get(row2, 'officer_context'),
-            'officer_role': safe_get(row2, 'officer_role')
-        })
-    
-    # Update the main columns (for quick reference)
-    merged_row['officer_context'] = ' '.join(filter(None, [safe_get(row1, 'officer_context'), safe_get(row2, 'officer_context')]))
-    merged_row['officer_role'] = '; '.join(filter(None, [safe_get(row1, 'officer_role'), safe_get(row2, 'officer_role')]))
-    merged_row['fn'] = ', '.join(filter(None, [fn1, fn2]))
+    merged_row['officer_context'] = ' '.join(filter(None, [safe_str(row1.get('officer_context', '')), safe_str(row2.get('officer_context', ''))]))
+    merged_row['officer_role'] = '; '.join(filter(None, [safe_str(row1.get('officer_role', '')), safe_str(row2.get('officer_role', ''))]))
+    merged_row['fn'] = ', '.join(filter(None, [safe_str(row1['fn']), safe_str(row2['fn'])]))
     
     return merged_row
 
-
-def iterative_merge(df, model):
-    merged = False
-    while not merged:
-        merged = True
-        to_drop = []
-        new_rows = []
-        for i, row1 in df.iterrows():
-            for j, row2 in df.iterrows():
-                if i >= j:
-                    continue
-                comparison = compare_entities(row1, row2, model)
-                if comparison and comparison['prediction'] > 0.5:
-                    new_row = merge_rows(row1, row2)
-                    new_rows.append(new_row)
-                    to_drop.extend([i, j])
-                    merged = False
-                    break
-            if not merged:
-                break
-        
-        # Drop the merged rows
-        df = df.drop(to_drop).reset_index(drop=True)
-        
-        # Add the new merged rows
-        if new_rows:
-            new_rows_df = pd.DataFrame(new_rows)
-            df = pd.concat([df, new_rows_df], ignore_index=True)
-    
-    return df
-
-
-def process_chunk(chunk, df, model):
-    to_drop = []
-    new_rows = []
-    for i, row1 in chunk.iterrows():
-        for j, row2 in df.iterrows():
-            if i >= j:
-                continue
-            comparison = compare_entities(row1, row2, model)
-            if comparison and comparison['prediction'] > 0.5:
-                new_row = merge_rows(row1, row2)
-                new_rows.append(new_row)
-                to_drop.extend([i, j])
-                break
-    return to_drop, new_rows
-
-def parallel_iterative_merge(df, model, num_processes=None):
-    if num_processes is None:
-        num_processes = mp.cpu_count()
-
-    pool = mp.Pool(processes=num_processes)
-    
-    # Group by filename
-    grouped = df.groupby('fn')
-    
-    # First, deduplicate within each file
-    deduped_groups = []
-    for _, group in grouped:
-        while True:
-            chunk_size = max(1, len(group) // num_processes)
-            chunks = [group.iloc[i:i+chunk_size] for i in range(0, len(group), chunk_size)]
-            
-            process_chunk_partial = partial(process_chunk, df=group, model=model)
-            results = pool.map(process_chunk_partial, chunks)
-            
-            all_to_drop = set()
-            all_new_rows = []
-            for to_drop, new_rows in results:
-                all_to_drop.update(to_drop)
-                all_new_rows.extend(new_rows)
-            
-            if not all_to_drop:
-                break
-            
-            group = group.drop(list(all_to_drop)).reset_index(drop=True)
-            
-            if all_new_rows:
-                new_rows_df = pd.DataFrame(all_new_rows)
-                group = pd.concat([group, new_rows_df], ignore_index=True)
-        
-        deduped_groups.append(group)
-    
-    # Combine all deduped groups
-    df = pd.concat(deduped_groups, ignore_index=True)
-    
-    # Now deduplicate between files
-    while True:
-        chunk_size = max(1, len(df) // num_processes)
-        chunks = [df.iloc[i:i+chunk_size] for i in range(0, len(df), chunk_size)]
-        
-        process_chunk_partial = partial(process_chunk, df=df, model=model)
-        results = pool.map(process_chunk_partial, chunks)
-        
-        all_to_drop = set()
-        all_new_rows = []
-        for to_drop, new_rows in results:
-            all_to_drop.update(to_drop)
-            all_new_rows.extend(new_rows)
-        
-        if not all_to_drop:
-            break
-        
-        df = df.drop(list(all_to_drop)).reset_index(drop=True)
-        
-        if all_new_rows:
-            new_rows_df = pd.DataFrame(all_new_rows)
-            df = pd.concat([df, new_rows_df], ignore_index=True)
-    
-    pool.close()
-    pool.join()
-    
-    return df
-
 def main():
     df = read_csv("../../blocking/data/output/clean-index-with-blocks.csv")
+    print(df.shape)
     df = df.drop_duplicates()
-    df = df.sample(n=5000, random_state=1) 
+    print(df.shape)
+    # df = df.sample(n=500, random_state=1) 
     model = read_model('../../ts-train-model/data/output/trained_lr_model.pkl')
     
-    merged_df = parallel_iterative_merge(df, model, num_processes=25)
+    merged_df = batch_parallel_iterative_merge(df, model, batch_size=10, num_processes=20)
     
     print("Merged DataFrame shape:", merged_df.shape)
     merged_df.to_csv("../data/output/merged_officer_profiles.csv", index=False)
